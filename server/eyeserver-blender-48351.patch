@@ -1,0 +1,611 @@
+Index: intern/cycles/blender/blender_session.cpp
+===================================================================
+--- intern/cycles/blender/blender_session.cpp	(revision 48351)
++++ intern/cycles/blender/blender_session.cpp	(working copy)
+@@ -37,6 +37,10 @@
+ #include "blender_session.h"
+ #include "blender_util.h"
+ 
++#include <sys/types.h>
++#include <sys/socket.h>
++
++
+ CCL_NAMESPACE_BEGIN
+ 
+ BlenderSession::BlenderSession(BL::RenderEngine b_engine_, BL::UserPreferences b_userpref_,
+@@ -244,6 +248,64 @@
+ 	RE_engine_end_result((RenderEngine*)b_engine.ptr.data, (RenderResult*)b_rr.ptr.data);
+ }
+ 
++int rle_encode(char* &dest, unsigned short* src, int len)
++{
++    unsigned short *rle = new unsigned short [len * 2];
++    rle[0] = 1;
++    rle[1] = src[0];
++    int i = 1, j = 0;
++    for (; i < len; i++) {
++        if (rle[j + 1] == src[i])
++            rle[j]++;
++        else {
++            j += 2;
++            rle[j + 1] = src[i];
++            rle[j] = 1;
++        }
++    }
++    dest = (char*) new char [len * 3 + 4];
++    char *t = dest + 4;
++    int cnt = 0, begin = 1;
++    for (i = 0; i <= j; i += 2) {
++        if (rle[i] == 1)
++            cnt++;
++        if (rle[i] != 1 || i==j) {
++            while (cnt) {
++                int tcnt = (cnt > 128) ? 128 : cnt;
++                cnt -= tcnt;
++                *t++ = tcnt - 1;   // 0 = length one, 127 = 128 len sequence
++                while (tcnt--) {
++                    *(unsigned short*)t = rle[begin];
++                    t += 2;
++                    begin += 2;
++                }
++            }
++        }
++        if (rle[i] != 1) {
++            // len 130 will emit -128 and 0, which is valid
++            while (rle[i]) {
++                int tcnt = (rle[i] > 129) ? 129 : rle[i];
++                rle[i] -= tcnt;
++                *t++ = -(tcnt - 1);  // -1 = length two, -128 = 129 len sequence
++                *(unsigned short*)t = rle[i + 1];
++                t += 2;
++            }
++            begin = i + 3;  // next may be start of diff seq
++        }
++    }
++    delete [] rle;
++    *(unsigned int *) dest = t - dest - 4;
++    return t - dest;
++}
++
++inline unsigned short to565(float *rgb, float norm=1.) {
++    unsigned short packed;
++    packed  = ((unsigned short)(*rgb++ / norm * 0xff) >> 3);
++    packed |= ((unsigned short)(*rgb++ / norm * 0xff) >> 2 << 5);
++    packed |= ((unsigned short)(*rgb++ / norm * 0xff) >> 3 << 11);
++    return packed;
++}
++
+ void BlenderSession::write_render_result()
+ {
+ 	/* get state */
+@@ -280,7 +342,68 @@
+ 	/* copy combined pass */
+ 	if(buffers->get_pass(PASS_COMBINED, exposure, sample, 4, &pixels[0]))
+ 		rna_RenderLayer_rect_set(&b_rlay.ptr, &pixels[0]);
++	
++	string st, sst;
++	session->progress.get_status(st, sst);
++	if (st == "Finished"
++	 && scene->camera->type == CAMERA_RETINA 
++	 && scene->camera->retina
++	 && scene->camera->retina_socket
++	 ) {
++	    int socket = scene->camera->retina_socket & 0xffff;
++	    int fmt = scene->camera->retina_socket >> 16;
++	    width = params.width;
++	    height = params.height;
+ 
++	    RadialArray *r = scene->camera->retina;
++	    
++	    char *data=NULL;
++	    int len=0;
++	    
++	    if (fmt==0) {
++	        float *timg = new float[r->totalpixels * 3];
++	        float *tptr = timg, *pixel;
++	        for (int i = 0; i < r->arccnt; i++) {
++	            pixel = &pixels[i * width * 4];
++	            for (int j = 0; j < r->arcs[i].length; j++) {
++	                *tptr++ = *pixel++;
++	                *tptr++ = *pixel++;
++	                *tptr++ = *pixel++;
++	                pixel++;
++	            }
++	        }
++	        data = (char*)timg;
++	        len = sizeof(float) * r->totalpixels * 3;
++	    } else { // fmt==1, RLE565
++	        unsigned short *i565 = new unsigned short[r->totalpixels];
++	        unsigned short *ipix = i565;
++	        float *pixel, norm=0;
++	        for (int i = 0; i < r->arccnt; i++) {
++	            pixel = &pixels[i * width * 4];
++	            for (int j = 0; j < r->arcs[i].length; j++) {
++	                if (pixel[0] > norm) norm = pixel[0];
++	                if (pixel[1] > norm) norm = pixel[1];
++	                if (pixel[2] > norm) norm = pixel[2];
++	                pixel += 4;
++	            }
++	        }
++	        for (int i = 0; i < r->arccnt; i++) {
++	            pixel = &pixels[i * width * 4];
++	            for (int j = 0; j < r->arcs[i].length; j++) {
++                    *ipix++ = to565(pixel, norm);
++	                pixel += 4;
++	            }
++	        }
++	        len = rle_encode(data, i565, r->totalpixels);
++	        delete [] i565;
++	    }
++	    std::cout << "sending retinal image (" << len << " bytes)... ";
++	    send(socket, data, len, 0);
++	    std::cout << " done" << std::endl;
++	    delete [] data;
++	}
++
++
+ 	/* tag result as updated */
+ 	RE_engine_update_result((RenderEngine*)b_engine.ptr.data, (RenderResult*)b_rr.ptr.data);
+ }
+Index: intern/cycles/blender/blender_camera.cpp
+===================================================================
+--- intern/cycles/blender/blender_camera.cpp	(revision 48351)
++++ intern/cycles/blender/blender_camera.cpp	(working copy)
+@@ -48,6 +48,11 @@
+ 
+ 	float2 pixelaspect;
+ 
++    char retina[1024];
++	float retina_fov;
++	bool opposite_eye;
++	int retina_socket;
++
+ 	PanoramaType panorama_type;
+ 	float fisheye_fov;
+ 	float fisheye_lens;
+@@ -113,6 +118,9 @@
+ 			case BL::Camera::type_PANO:
+ 				bcam->type = CAMERA_PANORAMA;
+ 				break;
++			case BL::Camera::type_RETINA:
++				bcam->type = CAMERA_RETINA;
++				break;
+ 			case BL::Camera::type_PERSP:
+ 			default:
+ 				bcam->type = CAMERA_PERSPECTIVE;
+@@ -133,6 +141,13 @@
+ 				break;
+ 		}	
+ 
++        if (bcam->type == CAMERA_RETINA)
++			bcam->panorama_type = PANORAMA_EQUIRECTANGULAR;
++		RNA_string_get(&ccamera, "retina", bcam->retina);
++		bcam->retina_fov = RNA_float_get(&ccamera, "retina_fov");
++		bcam->opposite_eye = RNA_boolean_get(&ccamera, "opposite_eye");
++		bcam->retina_socket = RNA_int_get(&ccamera, "retina_socket");
++
+ 		bcam->fisheye_fov = RNA_float_get(&ccamera, "fisheye_fov");
+ 		bcam->fisheye_lens = RNA_float_get(&ccamera, "fisheye_lens");
+ 
+@@ -177,7 +192,7 @@
+ {
+ 	Transform result;
+ 
+-	if(type == CAMERA_PANORAMA) {
++	if(type == CAMERA_PANORAMA || type == CAMERA_RETINA) {
+ 		/* make it so environment camera needs to be pointed in the direction
+ 		 * of the positive x-axis to match an environment texture, this way
+ 		 * it is looking at the center of the texture */
+@@ -239,7 +254,7 @@
+ 		*aspectratio = bcam->ortho_scale/2.0f;
+ 	}
+ 
+-	if(bcam->type == CAMERA_PANORAMA) {
++	if(bcam->type == CAMERA_PANORAMA || bcam->type == CAMERA_RETINA) {
+ 		/* set viewplane */
+ 		*left = 0.0f;
+ 		*right = 1.0f;
+@@ -291,6 +306,13 @@
+ 	/* type */
+ 	cam->type = bcam->type;
+ 
++    /* retina */
++    prevcam.retina = NULL;
++    cam->retina_path = bcam->retina;
++    cam->retina_fov = bcam->retina_fov;
++    cam->opposite_eye = bcam->opposite_eye;
++    cam->retina_socket = bcam->retina_socket;
++
+ 	/* panorama */
+ 	cam->panorama_type = bcam->panorama_type;
+ 	cam->fisheye_fov = bcam->fisheye_fov;
+@@ -505,6 +527,17 @@
+ {
+ 	BufferParams params;
+ 
++    cam->update();
++    if (cam->type == CAMERA_RETINA && cam->retina) {
++    	params.full_width = params.width = cam->retina->maxlength;
++    	params.full_height = params.height = cam->retina->arccnt;
++	    BL::RenderSettings rdata = b_scene.render();
++	    RNA_int_set(&rdata.ptr, "resolution_x", params.width);
++	    RNA_int_set(&rdata.ptr, "resolution_y", params.height);
++	    RNA_int_set(&rdata.ptr, "resolution_percentage", 100);
++    	return params;
++    }
++
+ 	params.full_width = width;
+ 	params.full_height = height;
+ 
+Index: intern/cycles/blender/addon/properties.py
+===================================================================
+--- intern/cycles/blender/addon/properties.py	(revision 48351)
++++ intern/cycles/blender/addon/properties.py	(working copy)
+@@ -23,7 +23,8 @@
+                        EnumProperty,
+                        FloatProperty,
+                        IntProperty,
+-                       PointerProperty)
++                       PointerProperty,
++                       StringProperty)
+ 
+ import math
+ 
+@@ -292,6 +293,29 @@
+                 type=cls,
+                 )
+ 
++        cls.retina = StringProperty(
++                name="Retina File",
++                maxlen=1024,
++                description="Path to the retina allocation file",
++                subtype='FILE_PATH',
++                )
++        cls.retina_fov = FloatProperty(
++                name="Retina FoV",
++                description="Maximum visible angle",
++                min=10.0, max=270.0,
++                default=100.,
++                step=10,
++                precision=1,
++                )
++        cls.opposite_eye = BoolProperty(
++                name="Opposite Eye",
++                description="Mirror the allocation pattern",
++                )
++        cls.retina_socket = IntProperty(
++                name="Retina Socket",
++                description="Communication channel for image transmission",
++                default=0,
++                )
+         cls.aperture_type = EnumProperty(
+                 name="Aperture Type",
+                 description="Use F/stop number or aperture radius",
+Index: intern/cycles/render/camera.cpp
+===================================================================
+--- intern/cycles/render/camera.cpp	(revision 48351)
++++ intern/cycles/render/camera.cpp	(working copy)
+@@ -25,6 +25,8 @@
+ 
+ Camera::Camera()
+ {
++    retina = NULL;
++
+ 	shuttertime = 1.0f;
+ 
+ 	aperturesize = 0.0f;
+@@ -79,12 +81,20 @@
+ 
+ Camera::~Camera()
+ {
++    if (retina) {
++        delete retina;
++        retina = NULL;
++    }
+ }
+ 
+ void Camera::update()
+ {
+ 	if(!need_update)
+ 		return;
++
++	/* retina */
++    if (retina) delete retina;
++    retina = new RadialArray(retina_path.c_str());
+ 	
+ 	/* ndc to raster */
+ 	Transform screentocamera;
+@@ -203,6 +213,11 @@
+ 
+ 	/* type */
+ 	kcam->type = type;
++	
++	/* retina */
++    kcam->retina = retina;
++	kcam->retina_fov = retina_fov;
++	kcam->opposite_eye = opposite_eye;
+ 
+ 	/* panorama */
+ 	kcam->panorama_type = panorama_type;
+@@ -260,6 +275,9 @@
+ 		(matrix == cam.matrix) &&
+ 		(motion == cam.motion) &&
+ 		(use_motion == cam.use_motion) &&
++		(retina_path == cam.retina_path) &&
++		(opposite_eye == cam.opposite_eye) &&
++		(retina_fov == cam.retina_fov) &&
+ 		(panorama_type == cam.panorama_type) &&
+ 		(fisheye_fov == cam.fisheye_fov) &&
+ 		(fisheye_lens == cam.fisheye_lens));
+Index: intern/cycles/render/camera.h
+===================================================================
+--- intern/cycles/render/camera.h	(revision 48351)
++++ intern/cycles/render/camera.h	(working copy)
+@@ -21,6 +21,7 @@
+ 
+ #include "kernel_types.h"
+ 
++#include "util_string.h"
+ #include "util_transform.h"
+ #include "util_types.h"
+ 
+@@ -50,6 +51,13 @@
+ 	CameraType type;
+ 	float fov;
+ 
++	/* retina */
++	string retina_path;
++	RadialArray *retina;
++	float retina_fov;
++	bool opposite_eye;
++	int retina_socket;
++
+ 	/* panorama */
+ 	PanoramaType panorama_type;
+ 	float fisheye_fov;
+Index: intern/cycles/app/cycles_xml.cpp
+===================================================================
+--- intern/cycles/app/cycles_xml.cpp	(revision 48351)
++++ intern/cycles/app/cycles_xml.cpp	(working copy)
+@@ -304,6 +304,12 @@
+ 		cam->type = CAMERA_PERSPECTIVE;
+ 	else if(xml_equal_string(node, "type", "panorama"))
+ 		cam->type = CAMERA_PANORAMA;
++	else if(xml_equal_string(node, "type", "retina")) {
++		cam->type = CAMERA_RETINA;
++		xml_read_string(&cam->retina, node, "retina");
++		xml_read_float(&cam->retina_fov, node, "retina_fov");
++		xml_read_bool(&cam->opposite_eye, node, "opposite_eye");
++	}
+ 
+ 	if(xml_equal_string(node, "panorama_type", "equirectangular"))
+ 		cam->panorama_type = PANORAMA_EQUIRECTANGULAR;
+Index: intern/cycles/kernel/kernel_types.h
+===================================================================
+--- intern/cycles/kernel/kernel_types.h	(revision 48351)
++++ intern/cycles/kernel/kernel_types.h	(working copy)
+@@ -22,6 +22,8 @@
+ #include "kernel_math.h"
+ #include "svm/svm_types.h"
+ 
++#include "radial_array.h"
++
+ #ifndef __KERNEL_GPU__
+ #define __KERNEL_CPU__
+ #endif
+@@ -295,7 +297,8 @@
+ enum CameraType {
+ 	CAMERA_PERSPECTIVE,
+ 	CAMERA_ORTHOGRAPHIC,
+-	CAMERA_PANORAMA
++	CAMERA_PANORAMA,
++	CAMERA_RETINA
+ };
+ 
+ /* Panorama Type */
+@@ -489,6 +492,11 @@
+ 	/* type */
+ 	int type;
+ 
++	/* retina */
++    RadialArray *retina;
++	float retina_fov;
++	bool opposite_eye;
++
+ 	/* panorama */
+ 	int panorama_type;
+ 	float fisheye_fov;
+Index: intern/cycles/kernel/kernel_camera.h
+===================================================================
+--- intern/cycles/kernel/kernel_camera.h	(revision 48351)
++++ intern/cycles/kernel/kernel_camera.h	(working copy)
+@@ -134,7 +134,7 @@
+ 
+ /* Panorama Camera */
+ 
+-__device void camera_sample_panorama(KernelGlobals *kg, float raster_x, float raster_y, Ray *ray)
++__device void camera_sample_panorama(KernelGlobals *kg, float raster_x, float raster_y, float lens_u, float lens_v, Ray *ray)
+ {
+ 	Transform rastertocamera = kernel_data.cam.rastertocamera;
+ 	float3 Pcamera = transform_perspective(&rastertocamera, make_float3(raster_x, raster_y, 0.0f));
+@@ -151,6 +151,33 @@
+ 
+ 	ray->D = panorama_to_direction(kg, Pcamera.x, Pcamera.y);
+ 
++	/* modify ray for depth of field */
++	float aperturesize = kernel_data.cam.aperturesize;
++
++    if(aperturesize > 0.0f) {
++        /* sample point on aperture */
++        float2 lensuv = camera_sample_aperture(kg, lens_u, lens_v)*aperturesize;
++
++        /* compute point on plane of focus */
++        float fd = kernel_data.cam.focaldistance;
++        float3 Dn = normalize(ray->D);
++        float3 Pf = Dn * fd;
++       
++        /* calculate orthonormal coordinates perpendicular to D */
++        float3 Uv, Vv;
++        if (!Dn.z) { // Dn is on the XY plane
++            Uv = make_float3(0.0f, 0.0f, 1.0f);
++            Vv = make_float3(-Dn.y, Dn.x, 0.0f);
++        } else {
++            Uv = normalize(cross(make_float3(1.0f, 0.0f, 0.0f), Dn));
++            Vv = normalize(cross(Uv, Dn));
++        }
++
++        /* update ray for effect of lens */
++        ray->P = Uv * lensuv.x + Vv * lensuv.y;
++        ray->D = normalize(Pf - ray->P);
++    }
++
+ 	/* indicates ray should not receive any light, outside of the lens */
+ 	if(len_squared(ray->D) == 0.0f) {
+ 		ray->t = 0.0f;
+@@ -185,7 +212,7 @@
+ 
+ /* Common */
+ 
+-__device void camera_sample(KernelGlobals *kg, int x, int y, float filter_u, float filter_v,
++__device void camera_sample(KernelGlobals *kg, float x, float y, float filter_u, float filter_v,
+ 	float lens_u, float lens_v, float time, Ray *ray)
+ {
+ 	/* pixel filter */
+@@ -206,7 +233,7 @@
+ 	else if(kernel_data.cam.type == CAMERA_ORTHOGRAPHIC)
+ 		camera_sample_orthographic(kg, raster_x, raster_y, ray);
+ 	else
+-		camera_sample_panorama(kg, raster_x, raster_y, ray);
++		camera_sample_panorama(kg, raster_x, raster_y, lens_u, lens_v, ray);
+ }
+ 
+ CCL_NAMESPACE_END
+Index: intern/cycles/kernel/kernel_path.h
+===================================================================
+--- intern/cycles/kernel/kernel_path.h	(revision 48351)
++++ intern/cycles/kernel/kernel_path.h	(working copy)
+@@ -883,6 +883,20 @@
+ 	__global float *buffer, __global uint *rng_state,
+ 	int sample, int x, int y, int offset, int stride)
+ {
++    RadialArray *ret = kernel_data.cam.retina;
++    float ax = x, ay = y, size=1.0f;
++
++    if (kernel_data.cam.type == CAMERA_RETINA) {
++        if (y >= ret->arccnt ||  x >= ret->arcs[y].length)
++            return;
++        ret->arcs[y].cartesian(x + ret->arcs[y].start, ax, ay);
++        ax *= (kernel_data.cam.width * kernel_data.cam.retina_fov / 360.0f) / ret->radius;
++        ay *= (kernel_data.cam.height * kernel_data.cam.retina_fov / 180.0f) / ret->radius;
++	    ay -= kernel_data.cam.height / 2;
++	    if (kernel_data.cam.opposite_eye) ax *= -1;
++	    size = ret->arcs[y].size / ret->arcs[ret->arccnt - 1].size;
++    }
++
+ 	/* buffer offset */
+ 	int index = offset + x + y*stride;
+ 	int pass_stride = kernel_data.film.pass_stride;
+@@ -890,19 +904,20 @@
+ 	rng_state += index;
+ 	buffer += index*pass_stride;
+ 
++
+ 	/* initialize random numbers */
+ 	RNG rng;
+ 
+ 	float filter_u;
+ 	float filter_v;
+ 
+-	path_rng_init(kg, rng_state, sample, &rng, x, y, &filter_u, &filter_v);
++	path_rng_init(kg, rng_state, sample, &rng, (int)ax, (int)ay, &filter_u, &filter_v);
+ 
+ 	/* sample camera ray */
+ 	Ray ray;
+ 
+-	float lens_u = path_rng(kg, &rng, sample, PRNG_LENS_U);
+-	float lens_v = path_rng(kg, &rng, sample, PRNG_LENS_V);
++	float lens_u = path_rng(kg, &rng, sample, PRNG_LENS_U) * size;
++	float lens_v = path_rng(kg, &rng, sample, PRNG_LENS_V) * size;
+ 
+ #ifdef __MOTION__
+ 	float time = path_rng(kg, &rng, sample, PRNG_TIME);
+@@ -910,7 +925,7 @@
+ 	float time = 0.0f;
+ #endif
+ 
+-	camera_sample(kg, x, y, filter_u, filter_v, lens_u, lens_v, time, &ray);
++	camera_sample(kg, ax, ay, filter_u * size, filter_v * size, lens_u, lens_v, time, &ray);
+ 
+ 	/* integrate */
+ 	float4 L;
+Index: release/scripts/startup/bl_ui/properties_data_camera.py
+===================================================================
+--- release/scripts/startup/bl_ui/properties_data_camera.py	(revision 48351)
++++ release/scripts/startup/bl_ui/properties_data_camera.py	(working copy)
+@@ -87,6 +87,12 @@
+         elif cam.type == 'ORTHO':
+             col.prop(cam, "ortho_scale")
+ 
++        elif cam.type == 'RETINA':
++            if context.scene.render.engine == 'CYCLES':
++                col.prop(cam.cycles, "retina")
++                col.prop(cam.cycles, "retina_fov")
++                col.prop(cam.cycles, "opposite_eye")
++
+         elif cam.type == 'PANO':
+             if context.scene.render.engine == 'CYCLES':
+                 ccam = cam.cycles
+Index: source/blender/makesdna/DNA_camera_types.h
+===================================================================
+--- source/blender/makesdna/DNA_camera_types.h	(revision 48351)
++++ source/blender/makesdna/DNA_camera_types.h	(working copy)
+@@ -48,7 +48,7 @@
+ 	ID id;
+ 	struct AnimData *adt;	/* animation data (must be immediately after id for utilities to use it) */ 
+ 	
+-	char type; /* CAM_PERSP, CAM_ORTHO or CAM_PANO */
++	char type; /* CAM_PERSP, CAM_ORTHO, CAM_PANO or CAM_RETINA */
+ 	char dtx; /* draw type extra */
+ 	short flag;
+ 	float passepartalpha;
+@@ -56,7 +56,7 @@
+ 	float lens, ortho_scale, drawsize;
+ 	float sensor_x, sensor_y;
+ 	float shiftx, shifty;
+-	
++
+ 	/* yafray: dof params */
+ 	/* qdn: yafray var 'YF_dofdist' now enabled for defocus composite node as well.
+ 	 * The name was not changed so that no other files need to be modified */
+@@ -76,6 +76,7 @@
+ #define CAM_PERSP		0
+ #define CAM_ORTHO		1
+ #define CAM_PANO		2
++#define CAM_RETINA		3
+ 
+ /* dtx */
+ #define CAM_DTX_CENTER			1
+Index: source/blender/collada/CameraExporter.cpp
+===================================================================
+--- source/blender/collada/CameraExporter.cpp	(revision 48351)
++++ source/blender/collada/CameraExporter.cpp	(working copy)
+@@ -70,6 +70,7 @@
+ 
+ 	switch (cam->type) {
+ 		case CAM_PANO:
++		case CAM_RETINA:
+ 		case CAM_PERSP: {
+ 			COLLADASW::PerspectiveOptic persp(mSW);
+ 			persp.setXFov(RAD2DEGF(focallength_to_fov(cam->lens, cam->sensor_x)), "xfov");
+Index: source/blender/makesrna/intern/rna_camera.c
+===================================================================
+--- source/blender/makesrna/intern/rna_camera.c	(revision 48351)
++++ source/blender/makesrna/intern/rna_camera.c	(working copy)
+@@ -98,6 +98,7 @@
+ 		{CAM_PERSP, "PERSP", 0, "Perspective", ""},
+ 		{CAM_ORTHO, "ORTHO", 0, "Orthographic", ""},
+ 		{CAM_PANO, "PANO", 0, "Panoramic", ""},
++		{CAM_RETINA, "RETINA", 0, "Retina", ""},
+ 		{0, NULL, 0, NULL, NULL}
+ 	};
+ 	static EnumPropertyItem prop_draw_type_extra_items[] = {
